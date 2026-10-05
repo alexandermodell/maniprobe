@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "maniprobe"
+version = "0.1.0"
+description = "The Manifold Probe: supervised discovery of representation manifolds in superposition"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Alexander Modell" }]
+requires-python = ">=3.9"
+dependencies = ["numpy", "scipy"]
+
+[project.urls]
+Repository = "https://github.com/alexandermodell/maniprobe"
+Paper = "https://arxiv.org/abs/2605.18537"
+
+[project.optional-dependencies]
+test = ["pytest"]
+vignettes = ["matplotlib", "jupyter"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["maniprobe"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
