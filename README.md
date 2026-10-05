@@ -15,7 +15,7 @@ linear function of the representations. For $k = 1, \ldots, d$, the feature $\ha
 and its linear prediction $g_k(x) = \hat w_k^\top x + \hat b_k$ solve
 
 $$
-\underset{f \in \mathcal H,\; w \in \mathbb R^p,\; b \in \mathbb R}{\operatorname{minimize}}
+\underset{f \in \mathcal H,\; w \in \mathbb R^p,\; b \in \mathbb R}{\mathrm{minimize}}
 \quad \sum_{i=1}^n \left( f(z_i) - w^\top x_i - b \right)^2 + \lambda_w \lVert w \rVert_2^2 + \lambda_f J(f)
 $$
 
