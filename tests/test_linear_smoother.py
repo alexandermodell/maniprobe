@@ -303,3 +303,46 @@ class TestSmoke:
             y = np.sin(6 * z) + 0.1 * rng.normal(size=N)
             s.set_y(y)
             assert np.allclose(s.fit().predict(), fitted(reference(s.basis, z), y).predict())
+
+
+# ---------------------------------------------------------------------------------
+# a basis the data covers only part of
+# ---------------------------------------------------------------------------------
+
+
+def disc_data(n=1500, seed=0):
+    """Covariates filling a disc inside the square a tensor-product basis spans, so
+    that most of the basis's corner functions have no data under them -- as a
+    rectangular basis over the mainland U.S. has over the oceans, Canada and Mexico."""
+    rng = np.random.default_rng(seed)
+    pts = rng.uniform(-1, 1, size=(4 * n, 2))
+    return pts[(pts**2).sum(1) < 0.5][:n]
+
+
+def disc_smoother(constraints=None):
+    basis = bs(k=(30, 30), limits=[(-1, 1), (-1, 1)])
+    return LinearSmoother(disc_data(), basis, constraints=constraints), basis
+
+
+class TestSparseSupport:
+    """The penalty weights `omega` of a design whose basis functions the data reaches
+    very unevenly span many decades. Read off an eigendecomposition of the whitened
+    penalty, the small ones -- the smooth directions a fit is made of -- were roundoff:
+    they came out negative, and the relative cut of a constrained re-diagonalisation
+    zeroed most of them, leaving the fit almost unpenalised."""
+
+    def test_omega_is_non_negative_with_the_exact_null_space(self):
+        s, basis = disc_smoother()
+        assert (s.omega >= 0).all()
+        # The basis is centred, which removes the constant from the null space.
+        assert np.count_nonzero(s.omega == 0) == basis.null_space_dim - 1
+
+    @pytest.mark.parametrize("n_constraints", [1, 3])
+    def test_a_constraint_keeps_the_penalty(self, rng, n_constraints):
+        s, basis = disc_smoother()
+        r = len(s.omega)
+        for _ in range(n_constraints):
+            s.add_constraints(rng.normal(size=s.X.shape[1]))
+        assert len(s.omega) == r - n_constraints
+        assert (s.omega >= 0).all()
+        assert np.count_nonzero(s.omega == 0) <= basis.null_space_dim - 1

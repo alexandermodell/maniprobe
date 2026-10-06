@@ -453,3 +453,35 @@ class TestManifold:
         X, z, _ = data
         with pytest.raises(ValueError, match="no components fitted; call fit first"):
             Probe(X, z, bs(K)).manifold()
+
+
+# ---------------------------------------------------------------------------------
+# a basis the data covers only part of
+# ---------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("criterion", [None, reml()])
+def test_sparse_support_recovers_every_feature(criterion):
+    """END-TO-END PIN for the precision of `omega`. A tensor-product spline over a
+    disc inside its square leaves most corner functions without data, the regime of
+    a rectangular basis over the mainland U.S. There the small penalty weights used to
+    be roundoff: the first fit selected `lmbda` at a NaN and stalled, and each
+    deflation constraint zeroed most of the weights, so later components overfit --
+    train R^2 near 1, test R^2 near 0. Three features are planted; all three must
+    come back, and out of sample."""
+    rng = np.random.default_rng(0)
+    pts = rng.uniform(-1, 1, size=(12000, 2))
+    z = pts[(pts**2).sum(1) < 0.5][:3000]
+    F = np.column_stack([z[:, 0], z[:, 1], np.exp(-8 * ((z - [0.2, -0.1]) ** 2).sum(1))])
+    # Unequal strengths, so the joint directions are well separated and the
+    # alternation converges well inside its sweep limit.
+    F = (F - F.mean(0)) / F.std(0) * [1.5, 1.0, 0.7]
+    X = F @ rng.normal(size=(3, 20)) + 0.5 * rng.normal(size=(len(z), 20))
+
+    basis = bs(k=(30, 30), limits=[(-1, 1), (-1, 1)])
+    probe = Probe(X[:1500], z[:1500], basis, criterion=criterion,
+                  test_set=(X[1500:], z[1500:]))
+    probe.fit(3)
+    for c in probe.components:
+        assert c.test_r2 > 0.9
+        assert c.r2 - c.test_r2 < 0.03

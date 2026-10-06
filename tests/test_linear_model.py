@@ -1428,3 +1428,51 @@ def test_penalised_spline_recovers_a_smooth_signal():
             m.fit()
             rmse = np.sqrt(((m.predict() - truth) ** 2).mean())
             assert rmse < 0.06, f"{name} rmse {rmse}"
+
+
+# ---------------------------------------------------------------------------------
+# NaN safety
+# ---------------------------------------------------------------------------------
+
+
+class _HoledGCV(lm.GCV):
+    """GCV with NaN punched into part of the grid, as a criterion evaluated on a
+    corrupt cache produces."""
+
+    def __init__(self, holes):
+        super().__init__()
+        self.holes = holes
+
+    def criterion(self, lmbda):
+        out = np.array(super().criterion(lmbda), dtype=float)
+        out[self.holes(len(out))] = np.nan
+        return out
+
+
+class TestNanSafety:
+    def test_selection_skips_nan(self, data):
+        """`np.argmin` returns the first NaN, so a criterion undefined anywhere on the
+        grid used to select that point; the selection must be GCV's own minimum."""
+        X, S, y = data
+        clean, holed = LinearModel(X, S), LinearModel(X, S)
+        for m, c in ((clean, lm.gcv()), (holed, _HoledGCV(lambda g: slice(0, g // 3)))):
+            m.set_lmbda_criterion(c)
+            m.set_y(y)
+            m.fit_lmbda()
+        grid = clean.lmbda_grid()
+        assert clean.lmbda > grid[len(grid) // 3]  # the minimum is not in the hole
+        assert holed.lmbda == clean.lmbda
+
+    def test_all_nan_raises(self, data):
+        X, S, y = data
+        m = LinearModel(X, S, lmbda_criterion=_HoledGCV(lambda g: slice(None)))
+        m.set_y(y)
+        with pytest.raises(FloatingPointError, match="NaN at every lmbda"):
+            m.fit_lmbda()
+
+    def test_negative_omega_is_refused(self, data):
+        X, S, _ = data
+        m = LinearModel(X, S)
+        m.omega[0] = -1e-6
+        with pytest.raises(FloatingPointError, match="negative penalty weight"):
+            m._normalize_omega()

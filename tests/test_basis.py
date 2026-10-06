@@ -1338,7 +1338,7 @@ SMOOTHS = {
             penalty=2, fan_out="identity",
         ),
         data="surface",
-        lmbda=2.9597818528652597,
+        lmbda=2.9597818528690008,
         edf=11.413443560504954,
         rss=0.25309003402459285,
         predict=[
@@ -1395,7 +1395,12 @@ class TestSmootherPins:
     them 6.3e-13 and 4.4e-12, with the floor and without it -- so `rtol=1e-12` here is
     tighter than the search's own reproducibility on a rank-deficient design. It is kept
     tight regardless: for fixed code and fixed data these are bit-exact, and that is
-    what makes the pin notice anything at all."""
+    what makes the pin notice anything at all.
+
+    The identity fan-out `lmbda` was a decision too: computing `omega` as
+    `1 / sigma**2` from the data's singular values, rather than by eigendecomposing the
+    whitened penalty (see `linear_model._diagonalise`), moved it by 1.3e-12 -- inside
+    the same band -- with its EDF, RSS and predictions unchanged at their pins."""
 
     @staticmethod
     def _fit(case):

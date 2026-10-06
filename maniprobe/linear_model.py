@@ -76,6 +76,100 @@ def _pinv_solve(S0, S01, atol):
     return Q @ ((Q.T @ S01) / lam[:, None])
 
 
+def _null_space(K, dim):
+    """The last `dim` right singular vectors of `K`: a basis of its null space whose
+    dimension was decided elsewhere.
+
+    The rank of a constraint is decided where its scale means something (on `ctilde`,
+    against the size of the map), and `K` is that constraint written in coordinates
+    whose columns are scaled by anything from `EPS` to `1 / EPS`. Measured against its
+    own spectrum it would be ranked wrongly, so the count is carried in instead -- the
+    same transfer `linalg.eig`'s `n_zero` makes for a congruence.
+
+    Parameters
+    ----------
+    K : ndarray, shape (k, m)
+    dim : int
+        `m` less the number of independent constraints.
+
+    Returns
+    -------
+    ndarray, shape (m, dim)
+        Orthonormal columns.
+    """
+    _, _, Vt = np.linalg.svd(K, full_matrices=True)
+    return Vt[len(Vt) - dim :].T
+
+
+def _diagonalise(M, Y):
+    """Diagonalise a penalty against an orthonormal design, never forming its matrix.
+
+    Coordinates `t` reach the fitted values through `M` -- the column `M @ t` is the fit
+    in an orthonormal basis of the column space -- and are penalised by
+    `||Y @ t||^2`. This returns an orthonormal basis `W` of `range(M)` and weights
+    `omega` with `t`'s penalty equal to `nu.T @ diag(omega) @ nu` at `M @ t == W @ nu`.
+
+    The obvious route forms the penalty in the orthonormal basis and eigendecomposes it,
+    and that route loses exactly the eigenvalues that matter. A basis function the data
+    barely reaches gets an enormous weight there, an eigensolver's absolute error is
+    machine epsilon times the largest weight, and so every *small* weight -- the smooth,
+    lightly penalised directions a fit is made of -- is roundoff, sign included. On a
+    40 x 80 tensor-product spline over the mainland U.S. the weights spanned 1e12,
+    two came out negative, and the relative cut of a constrained re-diagonalisation
+    zeroed 2,433 of 2,580 of them.
+
+    So the penalty is whitened first and the *data* decomposed instead: in coordinates
+    `y` with penalty `||y||^2`, the fitted columns have singular values `sigma`, and
+    `omega = 1 / sigma**2`. A small weight is now a large singular value, which an SVD
+    resolves to full relative accuracy; the roundoff lands on the large weights, whose
+    directions are shrunk to nothing at any `lmbda` a criterion would choose. And
+    `omega >= 0` holds by construction rather than by luck.
+
+    The penalty's null space is split off first -- it carries no `y` to whiten -- and
+    the penalised directions are made orthogonal to its fits, which is the profiling
+    `_build_cache` does in step 2, here on the design side.
+
+    Parameters
+    ----------
+    M : ndarray, shape (r, q)
+        Full column rank.
+    Y : ndarray, shape (m, q)
+        Any scale; only its row space and singular values enter.
+
+    Returns
+    -------
+    W : ndarray, shape (r, q')
+        Orthonormal; `q' == q` unless `M` was rank-deficient in a direction `Y`
+        leaves unpenalised.
+    omega : ndarray, shape (q',)
+        Ascending, the unpenalised entries exactly zero. Not normalised.
+    """
+    r, q = M.shape
+    if len(Y):
+        _, sy, Vyt, V0t = svd(Y, return_null=True)
+    else:
+        sy, Vyt, V0t = np.zeros(0), np.zeros((0, q)), np.eye(q)
+
+    # The penalty's null space, carried as an orthonormal basis of its fits.
+    Qn = svd(M @ V0t.T)[0] if len(V0t) else np.zeros((r, 0))
+
+    # The penalised directions, whitened (`t = Vy diag(1 / sy) y`, so the penalty is
+    # `||y||^2`) and profiled against the null space, whose fits are free.
+    P = (M @ Vyt.T) / sy
+    P -= Qn @ (Qn.T @ P)
+    if not P.shape[1]:
+        return Qn, np.zeros(Qn.shape[1])
+    Ub, sigma, _ = np.linalg.svd(P, full_matrices=False)
+
+    # A floor rather than a cut: a direction the data cannot resolve against the
+    # penalty is kept, shrunk to nothing, so that `U` keeps its rank. It also bounds
+    # `omega`'s spread at `1 / EPS**2`, which keeps `lmbda_grid` finite and every
+    # criterion free of `inf - inf`.
+    sigma = np.maximum(sigma, EPS * sigma[0])
+    W = np.hstack([Qn, Ub])
+    return W, np.concatenate([np.zeros(Qn.shape[1]), 1.0 / sigma**2])
+
+
 # ---------------------------------------------------------------------------------
 # model
 # ---------------------------------------------------------------------------------
@@ -177,13 +271,16 @@ class LinearModel:
         reach every null direction, and where it reaches none of them `S0` is roundoff
         throughout -- which is what `_pinv_solve`'s floor is for.
 
-        Step 3 -- whiten (`eta = D1^-1 mu`), restrict to the constraints, and
-        diagonalise. `M = Stil / D1 / D1.T` is the penalty in the coordinates where the
-        fitted values are `U1 @ mu`; under constraints it is `Q.T @ M @ Q`, for a `Q`
-        spanning their null space in those same coordinates. Either eigendecomposes as
-        `W diag(omega) W.T`, leaving `U = U1 @ Q @ W` orthonormal and the penalty
-        diagonal. `omega` are the eigenvalues of the pencil `(Stil, D1**2)`: penalty per
-        unit of the curvature the data supplies.
+        Step 3 -- whiten the penalty, restrict to the constraints, and diagonalise.
+        With `Stil = E diag(s) E.T`, write `eta = E0 @ z + E+ @ (y / sqrt(s+))`, so the
+        penalty is `||y||^2` and the fitted values are `U1 @ mu` with `mu = D1 * eta`.
+        Under constraints `(z, y)` is restricted to the null space of the constraints
+        written in those coordinates. `_diagonalise` then returns an orthonormal `W`
+        with `U = U1 @ W` and the penalty diagonal. `omega` are the eigenvalues of the
+        pencil `(Stil, D1**2)`: penalty per unit of the curvature the data supplies --
+        obtained as `1 / sigma**2` from the data's singular values rather than from an
+        eigendecomposition of `Stil / D1 / D1.T`, which resolves the small ones to
+        roundoff; see `_diagonalise` for why.
 
         Step 4 -- normalise `omega` to unit median over its non-zero entries, which
         fixes what `lmbda` means; see `_normalize_omega` and the module docstring.
@@ -200,21 +297,18 @@ class LinearModel:
         The whole of a constraint is therefore a null space taken in step 3's
         coordinates, at `O(k p r)` and without touching an n-sized array. Imposing it
         here rather than on the finished cache -- which is what `add_constraints` must
-        do, its constraint not being known until it is called -- saves an `r x r`
-        eigendecomposition and one `O(n r^2)` update of `U`. The two routes agree: `W`
-        is orthogonal, so `null(ctilde.T @ W) == W.T @ null(ctilde.T)`, and constraining
-        the diagonalised penalty and diagonalising the constrained one differ only by
-        the eigenvector conventions `linalg.eig` fixes. Earlier than here is worse, not
-        better: in `p` the null space is that of `C @ Xc.T @ Xc`, and the design would
-        then have to be decomposed a second time.
+        do, its constraint not being known until it is called -- saves one `r x r`
+        decomposition and one `O(n r^2)` update of `U`. The two routes agree: both
+        restrict the same whitened coordinates to the same subspace and diagonalise
+        what is left, differing only by the singular-vector conventions of the SVDs.
+        Earlier than here is worse, not better: in `p` the null space is that of
+        `C @ Xc.T @ Xc`, and the design would then have to be decomposed a second time.
 
-        The rank has to be decided on `Stil` and carried into step 3 rather than
-        measured there: the whitening is a congruence, which stretches the spectrum, so
-        the zeros are no longer where a tolerance applied afterwards would find them.
-        That transfer covers the whitening alone. Restricting to `range(Q)` is not an
-        invertible congruence -- an unpenalised direction can leave the subspace, and
-        generically does -- so under constraints the zeros are decided by the plain
-        relative rule, exactly as `add_constraints` decides them.
+        Two ranks are decided where their scale means something and carried forward
+        rather than measured again: the penalty's on `Stil`, at the scale of `S`, and
+        the constraints' on `ctilde`, against the size of the map. The coordinates
+        `(z, y)` between them are scaled by anything from `EPS` to `1 / EPS`, so no
+        tolerance applied there would find either.
         """
         U1, D1, V1t, V0t = svd(Xc, return_null=True)
 
@@ -226,10 +320,9 @@ class LinearModel:
         # W being orthogonal and V1.T's rows orthonormal.
         Q = None
         if C is not None:
+            ctilde = D1[:, None] * (V1t @ C.T)
             atol = EPS * D1.max() * np.linalg.norm(C, axis=1).max()
-            *_, ctilde_null = svd(
-                (D1[:, None] * (V1t @ C.T)).T, return_null=True, atol=atol
-            )
+            *_, ctilde_null = svd(ctilde.T, return_null=True, atol=atol)
             Q = ctilde_null.T
 
         if S is None and Q is None:
@@ -244,13 +337,10 @@ class LinearModel:
 
         if S is None:
             # Constrained ridge: the constraint mixes the coordinates 1 / D1^2 is
-            # diagonal in, so the short-circuit above no longer applies. Written as the
-            # Gram matrix of the scaled Q, which is Q.T @ diag(1 / D1**2) @ Q without
-            # forming the diagonal. Nothing is unpenalised here, so there are no zeros
-            # to place: n_zero = 0 asks for no thresholding, as the branch above gets
-            # none.
-            Qd = Q / D1[:, None]
-            T, M, n_zero = V1t.T, Qd.T @ Qd, 0
+            # diagonal in, so the short-circuit above no longer applies. `Stil` is the
+            # identity -- `xi` is penalised and unseen, so it is zero -- and so is its
+            # whitening: `mu = D1 * y` with penalty `||y||^2`.
+            T, M, Y = V1t.T, np.diag(D1), np.eye(len(D1))
         else:
             S = (S + S.T) / 2
             V1, V0 = V1t.T, V0t.T
@@ -265,26 +355,28 @@ class LinearModel:
             Stil = S1 - S01.T @ Z  # Schur complement
             T = V1 - V0 @ Z  # lift from reduced eta back to full beta
 
-            # Step 3: whiten (eta = D1^-1 mu), then diagonalise. The rank is decided
-            # here, on Stil, where the scale is still that of S.
-            stil_w, _ = eig(Stil, keep_zeros=True, atol=atol)
+            # Step 3: whiten the penalty. The rank is decided here, on Stil, where the
+            # scale is still that of S.
+            stil_w, E = eig(Stil, keep_zeros=True, atol=atol)
             if (stil_w < 0).any():
                 # Step 2 is a minimisation over xi only when S is PSD; otherwise Stil
                 # is the value at a saddle point. The cover is partial by construction:
                 # this sees the reduced problem, where beta lives, not a negative
                 # direction confined to null(Xc).
                 raise ValueError("S must be positive semi-definite")
-            M = Stil / D1[:, None] / D1[None, :]
-            n_zero = np.count_nonzero(stil_w == 0)
-            if Q is not None:
-                # The restriction can carry an unpenalised direction out of the
-                # subspace, so the inertia transfer stops here and the plain relative
-                # rule decides; see the docstring.
-                M, n_zero = Q.T @ M @ Q, None
+            pen = stil_w > 0
+            # eta = E0 @ z + E+ @ (y / sqrt(s)), so the penalty is ||y||^2, and the
+            # fitted values are U1 @ mu with mu = D1 * eta.
+            M = D1[:, None] * np.hstack([E[:, ~pen], E[:, pen] / np.sqrt(stil_w[pen])])
+            Y = np.eye(len(D1))[np.count_nonzero(~pen) :]
 
-        self.omega, W = eig(M, keep_zeros=True, n_zero=n_zero)
         if Q is not None:
-            W = Q @ W  # mu = Q @ nu, so one map carries the constraint and the rotation
+            # Restrict the coordinates (z, y) to those whose fit satisfies the
+            # constraints, with the count decided on `ctilde` above.
+            N = _null_space(ctilde.T @ M, Q.shape[1])
+            M, Y = M @ N, Y @ N
+
+        W, self.omega = _diagonalise(M, Y)
         self.U = U1 @ W
         self.A = (T / D1) @ W
         # U.T @ Xc, but U1.T @ Xc == diag(D1) @ V1.T exactly, so this costs O(r^2 p)
@@ -306,7 +398,16 @@ class LinearModel:
         they were told about a constraint would otherwise be searched over two different
         scales, which is what `cv.KFoldCV` rebuilding a constrained parent's folds would
         do.
+
+        It is also the one place every `omega` passes through, so it is where a negative
+        weight is refused. `_diagonalise` cannot produce one; a negative weight is a
+        shrinkage factor above 1 or below 0, and every criterion evaluated on it is
+        meaningless or NaN.
         """
+        if (self.omega < 0).any():
+            raise FloatingPointError(
+                f"negative penalty weight {self.omega.min():.3g}; the cache is corrupt"
+            )
         penalised = self.omega[self.omega > 0]
         self.omega = self.omega / (np.median(penalised) if len(penalised) else 1.0)
 
@@ -694,11 +795,10 @@ class LinearModel:
         """Constrain the fit so that `(X c).T @ (X beta) == 0`.
 
         In the orthonormal-design basis the constraint is just `ctilde.T @ nu == 0`
-        with `ctilde = pushforward(c)`, so it is imposed by reparametrising onto an
-        orthonormal basis `Q` of `null(ctilde.T)`. The design `U @ Q` stays
-        orthonormal but the penalty `Q.T diag(omega) Q` does not stay diagonal, so the
-        cache is re-diagonalised -- the same eigendecomposition as build step 3, and
-        then step 4 again, the constrained spectrum being a new spectrum. A `lmbda`
+        with `ctilde = pushforward(c)`, so it is imposed by restricting to
+        `null(ctilde.T)`. The restricted penalty is no longer diagonal, so the cache is
+        re-diagonalised -- by `_diagonalise`, as in build step 3 -- and then step 4 runs
+        again, the constrained spectrum being a new spectrum. A `lmbda`
         already set therefore buys a slightly different amount of smoothing afterwards;
         `edf` is the coordinate that carries across a constraint, so `set_edf` is how to
         hold the complexity of the fit fixed over one.
@@ -733,16 +833,20 @@ class LinearModel:
         Ctilde = self.pushforward(C.T)
         atol = EPS * np.linalg.norm(self.A_inv, 2) * np.linalg.norm(C, axis=1).max()
         *_, ctilde_null = svd(Ctilde.T, return_null=True, atol=atol)
-        Q = ctilde_null.T
 
-        # U @ Q is still orthonormal but Q.T diag(omega) Q is no longer diagonal, so
-        # re-diagonalise -- exactly build step 3 again. No cancellation here, so the
-        # plain relative rule is right.
-        omega, W = eig(Q.T @ (self.omega[:, None] * Q), keep_zeros=True)
-        QW = Q @ W
-        self.U = self.U @ QW
-        self.A = self.A @ QW
-        self.A_inv = QW.T @ self.A_inv
+        # Not `eig(Q.T @ diag(omega) @ Q)`: `omega` spans many decades, and that
+        # eigensolver's error is EPS**2 times the largest, so the small weights -- the
+        # ones a fit is made of -- come back as roundoff and the relative cut zeroes
+        # most of them. Instead the cache is read in its whitened form,
+        # `nu = E0 @ z + E+ @ (y / sqrt(omega+))` with penalty `||y||^2`, and
+        # re-diagonalised exactly as build step 3 does; see `_diagonalise`.
+        pen = self.omega > 0
+        scale = 1.0 / np.sqrt(np.where(pen, self.omega, 1.0))
+        N = _null_space(Ctilde.T * scale, ctilde_null.shape[0])
+        W, omega = _diagonalise(scale[:, None] * N, N[pen])
+        self.U = self.U @ W
+        self.A = self.A @ W
+        self.A_inv = W.T @ self.A_inv
         self.omega = omega
         self._normalize_omega()
         self.constraints = (
@@ -837,7 +941,14 @@ class LmbdaCriterion:
             raise ValueError("criterion is not attached; use set_lmbda_criterion")
         # One call with the whole grid: every criterion here is vectorised over lmbda.
         grid = self.model.lmbda_grid(self.grid_size, self.edf_tol)
-        return grid[np.argmin(self.criterion(grid))]
+        scores = self.criterion(grid)
+        # `np.argmin` returns the first NaN, so a criterion undefined anywhere on the
+        # grid would otherwise be "minimised" there.
+        if np.isnan(scores).all():
+            raise FloatingPointError(
+                f"{type(self).__name__} is NaN at every lmbda in the grid"
+            )
+        return grid[np.nanargmin(scores)]
 
 
 class GCV(LmbdaCriterion):
