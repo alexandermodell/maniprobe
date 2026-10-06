@@ -496,6 +496,146 @@ class TestBSplineKnots:
 
 
 # ---------------------------------------------------------------------------------
+# BSplineBasis -- cyclic
+# ---------------------------------------------------------------------------------
+
+
+def cyclic(degree=3, k=8, penalty=2, knots="uniform", limits=(0.0, 1.0)):
+    return BSplineBasis(
+        degree=degree, k=k, knots=knots, limits=limits, penalty=penalty, cyclic=True
+    )
+
+
+def periodic_columns(basis, m=0):
+    """Each cyclic basis function as scipy's own periodic spline: the coefficients of
+    the `degree` B-splines past the period tied to the first `degree`, and scipy left
+    to do the wrapping. Shares the knot vector with the code, and nothing else -- not
+    the fold, and not the reading of a point modulo the period."""
+    t, d, k = basis.knot_vector, basis.degree, basis.k
+    out = []
+    for e in np.eye(k):
+        s = BSpline(t, np.concatenate([e, e[:d]]), d, extrapolate="periodic")
+        out.append(s.derivative(m) if m else s)
+    return out
+
+
+class TestBSplineCyclic:
+    @pytest.mark.parametrize("degree,k", [(0, 3), (1, 4), (2, 5), (3, 8), (5, 9)])
+    def test_matches_scipy_periodic_splines(self, degree, k):
+        """Over three periods, so the wrap is exercised as well as the fold."""
+        b = cyclic(degree=degree, k=k, penalty=None, limits=(-1.0, 2.0)).setup()
+        z = np.random.default_rng(0).uniform(-4.0, 5.0, 50)
+        ref = np.column_stack([s(z) for s in periodic_columns(b)])
+        close(b.model_matrix(z), ref)
+
+    @pytest.mark.parametrize("order", [1, 2, 3])
+    def test_derivatives_match_scipy_periodic_splines(self, order):
+        b = cyclic(degree=3, k=7, knots="quantiles", penalty=2).setup(
+            curve_data()[0]
+        )
+        z = np.random.default_rng(1).uniform(-1.0, 2.0, 50)
+        ref = np.column_stack([s(z) for s in periodic_columns(b, order)])
+        close(b.derivative_matrix(z, order), ref, tol=1e-11)
+
+    def test_the_knot_vector_continues_periodically(self):
+        b = cyclic(degree=2, k=4, limits=(0.0, 4.0), penalty=1).setup()
+        close(b.knot_vector, [-2, -1, 0, 1, 2, 3, 4, 5, 6], tol=1e-15)
+        assert b.domain == (0.0, 4.0)
+
+    def test_quantile_knots_read_the_data_modulo_the_period(self):
+        """Data given a period off must place the same knots as the same data inside
+        `limits`, since those are the points the basis sees."""
+        z = curve_data()[0]
+        a = cyclic(knots="quantiles").setup(z)
+        b = cyclic(knots="quantiles").setup(z + 3.0)
+        close(a.knot_vector, b.knot_vector)
+
+    @pytest.mark.parametrize("degree", [1, 2, 3, 4])
+    def test_derivatives_join_across_the_wrap(self, degree):
+        """C^(degree - 1) at the ends, read from either side of the wrap. Shared with
+        scipy only through the definition of continuity."""
+        b = cyclic(degree=degree, k=degree + 3, penalty=None).setup()
+        h = 1e-7
+        for order in range(degree):
+            left = b.derivative_matrix(np.array([1.0 - h]), order)
+            right = b.derivative_matrix(np.array([h]), order)
+            scale = np.abs(b.derivative_matrix(np.linspace(0, 1, 50), order + 1)).max()
+            assert np.abs(left - right).max() < 4 * h * scale, order
+
+    def test_a_partition_of_unity_everywhere(self):
+        b = cyclic(degree=3, k=6, knots="quantiles").setup(curve_data()[0])
+        z = np.linspace(-2.0, 3.0, 201)
+        close(b.model_matrix(z).sum(axis=1), np.ones_like(z), tol=1e-14)
+
+    @pytest.mark.parametrize("m", [0, 1, 2, 3])
+    def test_gram_matches_quadpack(self, m):
+        """Exact, so compared at 1e-12. QUADPACK over one period, on scipy's periodic
+        splines, breaking at the knots inside it."""
+        b = cyclic(degree=3, k=7, knots="quantiles").setup(curve_data()[0])
+        cols = periodic_columns(b, m)
+        lo, hi = b.domain
+        inside = b.knot_vector[(b.knot_vector > lo) & (b.knot_vector < hi)]
+        ref = np.zeros((b.k, b.k))
+        for i in range(b.k):
+            for j in range(i, b.k):
+                f = lambda x, i=i, j=j: cols[i](x) * cols[j](x)
+                ref[i, j] = ref[j, i] = quad(f, lo, hi, points=inside, limit=200)[0]
+        close(b.gram_matrix(m), ref, tol=1e-10)
+
+    def test_gram_matches_a_finer_rule(self):
+        """The same claim at 1e-12, against 40 Gauss nodes on each of 64 panels, which
+        the uniform knots at eighths divide."""
+        b = cyclic(degree=3, k=8).setup()
+        gp, gw = leggauss(40)
+        edges = np.linspace(0.0, 1.0, 65)
+        mid, half = (edges[:-1] + edges[1:]) / 2, np.diff(edges) / 2
+        pts = (mid[:, None] + np.outer(half, gp)).ravel()
+        wts = np.outer(half, gw).ravel()
+        for m in (0, 2):
+            B = b.derivative_matrix(pts, m)
+            close(b.gram_matrix(m), (B * wts[:, None]).T @ B)
+
+    def test_uniform_knots_give_a_circulant_penalty(self):
+        """Every function is a translate of the first, so the penalty depends only on
+        the offset between two of them, modulo `k`."""
+        P = cyclic(degree=3, k=8).setup().penalty_matrix()
+        close(np.roll(P, (1, 1), axis=(0, 1)), P)
+
+    def test_the_null_space_is_the_constant(self):
+        b = cyclic(degree=3, k=8, penalty=2).setup()
+        assert b.null_space_dim == 1
+        close(b.penalty_matrix() @ np.ones(b.k), np.zeros(b.k))
+        assert cyclic(degree=3, k=8, penalty=0).setup().null_space_dim == 0
+
+    @pytest.mark.parametrize("ties", [(), (0.4,), (0.4, 0.7)])
+    @pytest.mark.parametrize("degree", [2, 3])
+    def test_null_space_dim_matches_the_penalty_rank(self, ties, degree):
+        """Tied data is how a cyclic basis gets a repeated knot. The rank is measured
+        relative to the matrix: a short span between a knot and its tied neighbour
+        makes the penalty's spread far larger than any absolute tolerance allows for.
+
+        The two-cluster case is where the circle is cut by more than one weak join
+        and the plain count holds; one cluster is where it is cut once; none is where
+        the constant is all that survives. Each cluster ties a knot two or three times,
+        which a linear basis cannot take: past multiplicity `degree + 1` a basis
+        function vanishes, which no count of joins describes, cyclic or not."""
+        z = np.concatenate([np.linspace(0.0, 1.0, 20)] + [[t] * 12 for t in ties])
+        for order in range(1, degree + 1):
+            b = cyclic(degree=degree, k=8, knots="quantiles", penalty=order).setup(z)
+            P = b.penalty_matrix()
+            rank = np.linalg.matrix_rank(P, tol=1e-12 * np.abs(P).max())
+            assert b.k - rank == b.null_space_dim, (order, b.knot_vector)
+
+    def test_cyclic_without_limits_raises(self):
+        with pytest.raises(ValueError, match="cyclic=True needs limits"):
+            BSplineBasis(k=6, knots="uniform", cyclic=True)
+
+    def test_cyclic_with_an_explicit_knot_vector_raises(self):
+        with pytest.raises(ValueError, match="cyclic=True needs limits"):
+            BSplineBasis(knots=[0.0] * 4 + [1.0] * 4, cyclic=True)
+
+
+# ---------------------------------------------------------------------------------
 # TensorProductBasis
 # ---------------------------------------------------------------------------------
 
@@ -983,6 +1123,17 @@ class TestBsplinesFactory:
         assert (b.ndim, b.k) == (2, 24)
         assert [(m.degree, m.k, m.penalty) for m in b.bases] == [(3, 6, 2), (1, 4, 1)]
 
+    def test_cyclic_reaches_the_right_margin(self, z2):
+        """Longitude by latitude: periodic on one axis only."""
+        b = bs(
+            k=(6, 5), knots="uniform", limits=[(0.0, 1.0), (0.0, 1.0)],
+            cyclic=(True, False),
+        )
+        assert [m.cyclic for m in b.bases] == [True, False]
+        b.setup(z2)
+        z = np.array([[0.0, 0.3], [1.0, 0.3]])
+        close(b.model_matrix(z)[0], b.model_matrix(z)[1])
+
     def test_a_per_axis_argument_of_the_wrong_length_raises(self):
         with pytest.raises(ValueError, match="penalty has 3 entries"):
             bs(k=(6, 4), knots="uniform", limits=(0.0, 1.0), penalty=(2, 1, 1))
@@ -1151,6 +1302,13 @@ LIFECYCLE = {
     "b-spline, explicit knots": (
         lambda: BSplineBasis(
             degree=3, knots=np.array([0.0] * 4 + [0.3, 0.6] + [1.0] * 4), penalty=2
+        ),
+        "curve",
+    ),
+    "b-spline, cyclic": (
+        lambda: BSplineBasis(
+            degree=3, k=8, knots="quantiles", limits=(0.0, 1.0), penalty=2,
+            cyclic=True,
         ),
         "curve",
     ),

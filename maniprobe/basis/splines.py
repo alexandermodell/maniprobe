@@ -9,6 +9,13 @@ knot vector. Precedence at setup is `knots` > `limits` > `z`. An explicit knot a
 makes the basis fully data-independent, so `setup()` may then be called with no argument
 at all, which is what prediction-only work or a model space fixed in advance needs.
 
+`cyclic=True` makes the basis periodic on `limits`: the function, and every derivative
+the degree allows, agrees at the two ends, and a point outside `limits` is read modulo
+the period. It is built from the ordinary basis rather than beside it. The `k + 1`
+distinct knots are extended by `degree` on each side periodically, the `k + degree`
+B-splines on that vector are evaluated by the same recursion, and the last `degree` are
+added onto the first -- on the domain they are the same functions shifted by one period.
+
 `bs()` at the bottom returns a `BSplineBasis` for one axis and a
 `TensorProductBasis` of B-spline margins for several. It is a factory rather than a
 merged class on purpose: a one-dimensional basis and a tensor product are genuinely
@@ -41,10 +48,13 @@ class BSplineBasis(Basis):
         As supplied.
     penalty : int or None
         Order of the penalised derivative.
+    cyclic : bool
     knot_vector : ndarray, shape (k + degree + 1,)
-        The full knot vector, including repeated boundary knots. Set at setup.
+        The full knot vector, including repeated boundary knots. Set at setup. When
+        cyclic, shape `(k + 2 * degree + 1,)`: the `k + 1` knots on `limits` and
+        `degree` more on each side, continued periodically.
     domain : (low, high)
-        Set at setup.
+        Set at setup. When cyclic, `limits`.
     """
 
     ndim = 1
@@ -57,6 +67,7 @@ class BSplineBasis(Basis):
         limits=None,
         penalty=None,
         centre=False,
+        cyclic=False,
     ):
         """
         Parameters
@@ -81,24 +92,35 @@ class BSplineBasis(Basis):
         centre : bool, optional
             Constrain the basis functions to sum to zero over the setup data; see
             `Basis`. Requires `z` at setup.
+        cyclic : bool, optional
+            Periodic on `limits`, which are then required: the period cannot be read
+            off the data, whose range falls short of it by the gap between the last
+            point and the first.
 
         Raises
         ------
         ValueError
             If `k` is neither given nor implied; if `k` or `limits` is given alongside
-            an explicit knot vector, which already fixes both; if `k < degree + 1`; or
+            an explicit knot vector, which already fixes both; if `cyclic` is given
+            without `limits` or with an explicit knot vector; if `k < degree + 1`; or
             if `penalty > degree`.
         """
         self._params = dict(
             k=k, degree=degree, knots=knots, limits=limits, penalty=penalty,
-            centre=centre,
+            centre=centre, cyclic=cyclic,
         )
         self.degree = degree
         self.knots = knots
         self.limits = limits
         self.penalty = penalty
         self.centre = centre
+        self.cyclic = cyclic
 
+        if cyclic and (limits is None or not isinstance(knots, str)):
+            raise ValueError(
+                "cyclic=True needs limits, which fix the period, and a placement rule "
+                "rather than an explicit knot vector."
+            )
         if isinstance(knots, str):
             if k is None:
                 raise ValueError("k is required unless knots is an explicit vector.")
@@ -136,7 +158,10 @@ class BSplineBasis(Basis):
             self.knot_vector = np.array(self._knot_array, dtype=float)
         else:
             self.knot_vector = self._place_knots(z)
-        self.domain = (float(self.knot_vector[0]), float(self.knot_vector[-1]))
+        if self.cyclic:
+            self.domain = (float(self.limits[0]), float(self.limits[1]))
+        else:
+            self.domain = (float(self.knot_vector[0]), float(self.knot_vector[-1]))
         if self.penalty is not None:
             self._penalty_matrix = self._quadrature_gram(self.penalty)
 
@@ -155,22 +180,30 @@ class BSplineBasis(Basis):
 
         # At k == degree + 1 there are no interior knots, and both rules return an
         # empty array that concatenates cleanly -- so this needs no branch of its own.
-        n_interior = self.k - self.degree - 1
+        # A cyclic basis has one function per span rather than `degree` more, so it
+        # has `k - 1` interior knots.
+        n_interior = self.k - 1 if self.cyclic else self.k - self.degree - 1
         if self.knots == "quantiles":
             if z is None:
                 raise ValueError(
                     "knots='quantiles' requires data. Pass z to setup(), or use "
                     "knots='uniform' for uniform spacing over limits."
                 )
-            interior = np.quantile(
-                np.asarray(z, dtype=float), np.linspace(0, 1, n_interior + 2)[1:-1]
-            )
+            z = np.asarray(z, dtype=float)
+            if self.cyclic:
+                z = lo + np.mod(z - lo, hi - lo)  # the points the basis will see
+            interior = np.quantile(z, np.linspace(0, 1, n_interior + 2)[1:-1])
         elif self.knots == "uniform":
             interior = np.linspace(lo, hi, n_interior + 2)[1:-1]
         else:
             raise ValueError(
                 "knots must be 'uniform', 'quantiles' or a knot vector; "
                 f"got {self.knots!r}."
+            )
+        if self.cyclic:
+            s, d, period = np.concatenate([[lo], interior, [hi]]), self.degree, hi - lo
+            return np.concatenate(
+                [s[self.k - d : self.k] - period, s, s[1 : d + 1] + period]
             )
         return np.concatenate(
             [np.full(self.degree + 1, lo), interior, np.full(self.degree + 1, hi)]
@@ -201,7 +234,7 @@ class BSplineBasis(Basis):
         Parameters
         ----------
         z : ndarray, shape (n,)
-            Already coerced; `model_matrix` does that once at the entry.
+            Already coerced; `_basis` does that once at the entry.
         degree : int
             Recursion variable, not a property of the basis.
         derivative : int, optional
@@ -253,6 +286,24 @@ class BSplineBasis(Basis):
             right = np.where(denom2 > 0, (m / denom2) * lower[:, 1:], 0.0)
         return left - right
 
+    def _basis(self, z, m):
+        """The `m`-th derivative of the basis at `z`, folded onto `k` columns when
+        cyclic.
+
+        The one entry to `_evaluate` for the model matrix, the derivatives and the
+        penalty alike, so that the penalty integrates the basis the model evaluates.
+        When cyclic, `z` is first read modulo the period, then each of the last
+        `degree` B-splines -- one of the first `degree`, one period on -- is added
+        onto its twin.
+        """
+        z = np.asarray(z, dtype=float)
+        if not self.cyclic:
+            return self._evaluate(z, self.degree, m)
+        lo, hi = self.domain
+        B = self._evaluate(lo + np.mod(z - lo, hi - lo), self.degree, m)
+        B[:, : self.degree] += B[:, self.k :]
+        return B[:, : self.k]
+
     def _model_matrix(self, z):
         """Basis functions evaluated at `z`.
 
@@ -260,13 +311,14 @@ class BSplineBasis(Basis):
         ----------
         z : array-like, shape (n,)
             Points outside the domain are extrapolated: the boundary spans' polynomials
-            are continued, rather than the basis dropping to zero.
+            are continued, rather than the basis dropping to zero. When cyclic they are
+            read modulo the period instead.
 
         Returns
         -------
         ndarray, shape (n, k)
         """
-        return self._evaluate(np.asarray(z, dtype=float), self.degree, 0)
+        return self._basis(z, 0)
 
     def derivative_matrix(self, z, order=1):
         """The `order`-th derivative of each basis function, evaluated at `z`.
@@ -285,7 +337,7 @@ class BSplineBasis(Basis):
         ndarray, shape (n, k)
         """
         self._require_setup()
-        return self._evaluate(np.asarray(z, dtype=float), self.degree, order)
+        return self._basis(z, order)
 
     def gram_matrix(self, derivative=0):
         """`G(m) = integral of (d^m B).T @ (d^m B)` over the domain.
@@ -310,12 +362,16 @@ class BSplineBasis(Basis):
         return self._quadrature_gram(derivative)
 
     def _quadrature_gram(self, m):
+        # Over the domain only, which a cyclic knot vector overhangs by `degree` knots
+        # on each side.
+        lo, hi = self.domain
         breaks = np.unique(self.knot_vector)
+        breaks = breaks[(breaks >= lo) & (breaks <= hi)]
         nodes, weights = leggauss(self.degree + 2)
         G = np.zeros((self.k, self.k))
         for a, b in zip(breaks[:-1], breaks[1:]):
             mid, half = (a + b) / 2, (b - a) / 2
-            B = self._evaluate(mid + half * nodes, self.degree, m)
+            B = self._basis(mid + half * nodes, m)
             G += (B * (half * weights)[:, None]).T @ B
         return G
 
@@ -352,15 +408,31 @@ class BSplineBasis(Basis):
         rather than extreme: a cubic with a knot tripled and `penalty=2` has null space
         3, not 2 and not 4 -- linear on each side, joined continuously, slope free.
 
+        Cyclic, every distinct knot in `[lo, hi)` is a join -- the wrap at `lo`
+        included -- so there are as many joins as spans, and the same count holds with
+        one exception. When every join takes back all `m` dimensions, the constraints
+        around the circle are dependent: they leave the polynomials of degree < `m`,
+        of which only the constant is periodic, so the answer is 1 where the count says
+        0. When some join takes back fewer, cutting the circle there leaves a chain,
+        whose count is exact. A repeated knot is reachable here only through tied
+        quantiles: a cubic with `penalty=2` and one knot tripled has null space 1 --
+        linear from one side of that knot round to the other, so constant -- and with
+        two such knots, 2.
+
         Needs the knot vector, so this is a property of the configured basis rather
         than of the hyperparameters alone.
         """
         self._require_penalty()
         self._require_setup()
-        m, values = self.penalty, np.unique(self.knot_vector)
-        _, counts = np.unique(self.knot_vector, return_counts=True)
+        m, d = self.penalty, self.degree
+        values, counts = np.unique(self.knot_vector, return_counts=True)
+        if self.cyclic:
+            lo, hi = self.domain
+            q = counts[(values >= lo) & (values < hi)]
+            joins = np.clip(np.minimum(d - q, m - 1) + 1, 0, m)
+            return m * len(joins) - joins.sum() + int(m > 0 and (joins == m).all())
         interior = counts[(values > values[0]) & (values < values[-1])]
-        joins = np.clip(np.minimum(self.degree - interior, m - 1) + 1, 0, m).sum()
+        joins = np.clip(np.minimum(d - interior, m - 1) + 1, 0, m).sum()
         return m * (len(values) - 1) - joins
 
 
@@ -376,6 +448,7 @@ def bs(
     limits=None,
     penalty=2,
     fan_out="integral",
+    cyclic=False,
 ):
     """B-splines on one axis or several: one basis, or a tensor product of them.
 
@@ -401,7 +474,7 @@ def bs(
     k : int or tuple of int, optional
         Number of basis functions on each axis, and how many axes there are. None only
         with explicit knot vectors, which fix it themselves.
-    degree, knots, limits, penalty
+    degree, knots, limits, penalty, cyclic
         As for `BSplineBasis`, per axis or broadcast. `penalty` defaults to 2 rather
         than to None: a factory that hands back a ready-to-smooth basis wants the
         second-derivative penalty, where the class itself takes no view.
@@ -423,13 +496,16 @@ def bs(
     # centring each margin does not centre their product, since the column means of a
     # row-wise Kronecker product are covariances rather than zeros.
     margins = [
-        BSplineBasis(k=a, degree=b, knots=c, limits=d, penalty=e, centre=ndim == 1)
-        for a, b, c, d, e in zip(
+        BSplineBasis(
+            k=a, degree=b, knots=c, limits=d, penalty=e, centre=ndim == 1, cyclic=f
+        )
+        for a, b, c, d, e, f in zip(
             _per_axis(k, ndim, "k"),
             _per_axis(degree, ndim, "degree"),
             _per_axis(knots, ndim, "knots", atom=_is_single),
             _per_axis(limits, ndim, "limits", atom=_is_single),
             _per_axis(penalty, ndim, "penalty"),
+            _per_axis(cyclic, ndim, "cyclic"),
         )
     ]
     if ndim == 1:

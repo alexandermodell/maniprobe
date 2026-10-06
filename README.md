@@ -91,11 +91,13 @@ from maniprobe import bs
 bs(k=20)                              # 20 cubic B-splines
 bs(k=20, degree=2, penalty=1)         # quadratic, with a first-derivative penalty
 bs(k=20, knots="uniform", limits=(1950, 2020))
+bs(k=12, limits=(0, 24), cyclic=True)  # periodic, e.g. hour of the day
 ```
 
 The knots are placed at quantiles of the data by default, or uniformly, or can be given
 explicitly as a knot vector. The boundary of $\mathcal Z$ is taken from the data unless
-`limits` is given.
+`limits` is given. A cyclic basis joins smoothly across its two ends, so it needs
+`limits`: the period cannot be read off the data.
 
 **Tensor products of B-splines**, for a concept on a rectangle such as latitude and
 longitude. Passing a tuple to `bs` gives one axis per entry, and every other argument
@@ -104,6 +106,7 @@ can be given per axis:
 ```python
 bs(k=(40, 80))                        # 40 x 80 functions on two axes
 bs(k=(20, 10), penalty=(2, 1))        # a different penalty on each axis
+bs(k=(40, 20), limits=[(-180, 180), (-90, 90)], cyclic=(True, False))  # the globe
 ```
 
 Each axis is penalized in its own units, so the axes need not be on the same scale.
